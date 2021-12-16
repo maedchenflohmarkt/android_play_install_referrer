@@ -4,68 +4,77 @@ import android.content.Context
 import androidx.annotation.NonNull
 import com.android.installreferrer.api.InstallReferrerClient
 import com.android.installreferrer.api.InstallReferrerStateListener
-import com.android.installreferrer.api.ReferrerDetails
 import io.flutter.embedding.engine.plugins.FlutterPlugin
-import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
-import io.flutter.plugin.common.PluginRegistry.Registrar
+import kotlinx.coroutines.*
 
 
+@ExperimentalCoroutinesApi
 /** AndroidPlayInstallReferrerPlugin */
 class AndroidPlayInstallReferrerPlugin : FlutterPlugin, MethodCallHandler {
-    private val CHANNEL_NAME = "de.lschmierer.android_play_install_referrer"
 
+    companion object {
+        const val CHANNEL_NAME = "de.lschmierer.android_play_install_referrer"
+    }
+    private var pluginScope:CoroutineScope? = null
     private lateinit var context: Context
     private var channel: MethodChannel? = null
 
     override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
-        setupChannel(flutterPluginBinding.binaryMessenger, flutterPluginBinding.applicationContext)
-    }
-
-    // This static function is optional and equivalent to onAttachedToEngine. It supports the old
-    // pre-Flutter-1.12 Android projects. You are encouraged to continue supporting
-    // plugin registration via this function while apps migrate to use the new Android APIs
-    // post-flutter-1.12 via https://flutter.dev/go/android-project-migration.
-    //
-    // It is encouraged to share logic between onAttachedToEngine and registerWith to keep
-    // them functionally equivalent. Only one of onAttachedToEngine or registerWith will be called
-    // depending on the user's project. onAttachedToEngine or registerWith must both be defined
-    // in the same class.
-    companion object {
-        @JvmStatic
-        fun registerWith(registrar: Registrar) {
-            AndroidPlayInstallReferrerPlugin().setupChannel(registrar.messenger(), registrar.context())
-        }
-    }
-
-    private fun setupChannel(messenger: BinaryMessenger, context: Context) {
-        this.context = context
-        channel = MethodChannel(messenger, CHANNEL_NAME)
+        this.context = flutterPluginBinding.applicationContext
+        channel = MethodChannel(flutterPluginBinding.binaryMessenger, CHANNEL_NAME)
         channel!!.setMethodCallHandler(this)
+        pluginScope = CoroutineScope(Job() + Dispatchers.Main)
+    }
+
+    override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+        channel?.setMethodCallHandler(null)
+        channel = null
+        pluginScope?.cancel()
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
         if (call.method == "getInstallReferrer") {
-            getInstallReferrer(call, result)
+            val client = InstallReferrerClient.newBuilder(context).build()
+            pluginScope?.launch {
+                val res = awaitCallback(client)
+                when (res.first) {
+                    InstallReferrerClient.InstallReferrerResponse.OK -> {
+                        if (res.second.isNotEmpty()) {
+                            result.success(res.second)
+                        } else {
+                            result.error("BAD_STATE", "Result is null.", null)
+                        }
+                    }
+                    InstallReferrerClient.InstallReferrerResponse.FEATURE_NOT_SUPPORTED -> {
+                        result.error("FEATURE_NOT_SUPPORTED", "API not available on the current Play Store app.", null)
+                    }
+                    InstallReferrerClient.InstallReferrerResponse.SERVICE_UNAVAILABLE -> {
+                        result.error("SERVICE_UNAVAILABLE", "Connection couldn't be established.", null)
+                    }
+                    InstallReferrerClient.InstallReferrerResponse.PERMISSION_ERROR -> {
+                        result.error("PERMISSION_ERROR", "App is not allowed to bind to the Service.", null)
+                    }
+                }
+            }
         } else {
             result.notImplemented()
         }
-
     }
 
-    fun getInstallReferrer(@NonNull call: MethodCall, @NonNull result: Result) {
-        val referrerClient = InstallReferrerClient.newBuilder(context).build()
-        referrerClient.startConnection(object : InstallReferrerStateListener {
+
+    private suspend fun awaitCallback(client: InstallReferrerClient): Pair<Int, Map<String, Any?>> = suspendCancellableCoroutine { continuation ->
+        val callback = object : InstallReferrerStateListener { // Implementation of some callback interface
             override fun onInstallReferrerSetupFinished(responseCode: Int) {
+                val details = HashMap<String, Any?>()
 
-                when (responseCode) {
-                    InstallReferrerClient.InstallReferrerResponse.OK -> {
-                        val referrerDetails = referrerClient.installReferrer
+                if (responseCode == InstallReferrerClient.InstallReferrerResponse.OK) {
+                    val referrerDetails = client.installReferrer
 
-                        val details = HashMap<String, Any?>()
+                    if (referrerDetails != null) {
                         details["installReferrer"] = referrerDetails.installReferrer
                         details["referrerClickTimestampSeconds"] = referrerDetails.referrerClickTimestampSeconds
                         details["installBeginTimestampSeconds"] = referrerDetails.installBeginTimestampSeconds
@@ -73,31 +82,19 @@ class AndroidPlayInstallReferrerPlugin : FlutterPlugin, MethodCallHandler {
                         details["installBeginTimestampServerSeconds"] = referrerDetails.installBeginTimestampServerSeconds
                         details["installVersion"] = referrerDetails.installVersion
                         details["googlePlayInstantParam"] = referrerDetails.googlePlayInstantParam
-
-                        result.success(details)
-                    }
-                    InstallReferrerClient.InstallReferrerResponse.FEATURE_NOT_SUPPORTED -> {
-                        result.error("FEATURE_NOT_SUPPORTED", "API not available on the current Play Store app.", null)
-                        return
-                    }
-                    InstallReferrerClient.InstallReferrerResponse.SERVICE_UNAVAILABLE -> {
-                        result.error("SERVICE_UNAVAILABLE", "Connection couldn't be established.", null)
-                        return
-                    }
-                    InstallReferrerClient.InstallReferrerResponse.PERMISSION_ERROR -> {
-                        result.error("PERMISSION_ERROR", "App is not allowed to bind to the Service.", null)
-                        return
                     }
                 }
-                referrerClient.endConnection()
+                client.endConnection()
+                // Resume coroutine with a value provided by the callback
+                continuation.resume(Pair(responseCode, details)) { client.endConnection() }
             }
 
-            override fun onInstallReferrerServiceDisconnected() {}
-        })
+            override fun onInstallReferrerServiceDisconnected() {
+            }
+        }
+        // Register callback with an API
+        client.startConnection(callback)
+        // Remove callback on cancellation
     }
 
-    override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
-        channel?.setMethodCallHandler(null)
-        channel = null
-    }
 }
